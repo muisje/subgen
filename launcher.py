@@ -3,6 +3,16 @@ import sys
 import urllib.request
 import subprocess
 import argparse
+import signal
+import select
+
+def forward_signal(signum, frame):
+    """Forward the signal to the child process."""
+    if child_process:
+        # os.kill(child_process.pid, signum)
+        child_process.send_signal(signum)
+
+
 
 def convert_to_bool(in_bool):
     # Convert the input to string and lower case, then check against true values
@@ -74,6 +84,15 @@ def load_env_variables(env_filename='subgen.env'):
     try:
         with open(env_filename, 'r') as file:
             for line in file:
+                line = line.strip()
+                # Skip empty lines or lines starting with a comment
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Split line into variable and value, allow comments after the value
+                if '#' in line:
+                    line = line.split('#', 1)[0].strip()  # Ignore anything after the # symbol
+                    
                 var, value = line.strip().split('=', 1)
                 os.environ[var] = value
 
@@ -83,6 +102,7 @@ def load_env_variables(env_filename='subgen.env'):
         print(f"{env_filename} file not found. Please run prompt_and_save_env_variables() first.")
 
 def main():
+    global child_process  # We'll need to refer to the child process later
     # Check if the script is run with 'python' or 'python3'
     if 'python3' in sys.executable:
         python_cmd = 'python3'
@@ -158,14 +178,69 @@ def main():
     else:
         print("subgen.py exists and UPDATE is set to False, skipping download.")
         
+
+
+
     if not args.exit_early:
         print(f'Launching subgen{script_name}')
+        
+        def forward_signal(signum, frame):
+            child_process.send_signal(signum)
+        
         if branch_name != 'main':
-            subprocess.run([f'{python_cmd}', '-u', f'subgen{script_name}'], check=True)
+            child_process = subprocess.Popen(
+                [sys.executable, '-u', f'subgen{script_name}'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
         else:
-            subprocess.run([f'{python_cmd}', '-u', 'subgen.py'], check=True)
-    else:
-        print("Not running subgen.py: -x or --exit-early set")
-
+            child_process = subprocess.Popen(
+                [sys.executable, '-u', 'subgen.py'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+        
+        signal.signal(signal.SIGINT, forward_signal)
+        signal.signal(signal.SIGTERM, forward_signal)
+        
+        try:
+            # Get file descriptors for stdout and stderr
+            stdout_fd = child_process.stdout.fileno()
+            stderr_fd = child_process.stderr.fileno()
+            
+            # Create sets for select
+            read_fds = [stdout_fd, stderr_fd]
+            
+            while child_process.poll() is None:
+                # Wait for output on either stream
+                readable, _, _ = select.select(read_fds, [], [], 0.1)
+                
+                for fd in readable:
+                    if fd == stdout_fd:
+                        output = child_process.stdout.readline()
+                        if output:
+                            print(output.rstrip(), flush=True)
+                    elif fd == stderr_fd:
+                        error = child_process.stderr.readline()
+                        if error:
+                            print(error.rstrip(), file=sys.stderr, flush=True)
+            
+            # Get final output
+            stdout, stderr = child_process.communicate()
+            if stdout:
+                print(stdout.rstrip(), flush=True)
+            if stderr:
+                print(stderr.rstrip(), file=sys.stderr, flush=True)
+            
+            return_code = child_process.wait()
+            sys.exit(return_code)
+            
+        finally:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGTERM, signal.default_int_handler)
+        
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    sys.exit(exit_code)
