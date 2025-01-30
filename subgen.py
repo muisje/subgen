@@ -11,7 +11,7 @@ import queue
 import logging
 import gc
 import random
-from typing import Union, Any
+from typing import Union, Any, Callable
 import numpy as np
 import stable_whisper
 from stable_whisper import Segment
@@ -26,7 +26,7 @@ import faster_whisper
 import io
 from stable_whisper.text_output import segment2srtblock, sec2vtt
 import traceback
-from typing import Any, List
+from typing import Union, List, Tuple, Optional, Any
 from fastapi import FastAPI, File, UploadFile, Query, Header, Body, Form, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -38,6 +38,9 @@ from unique_queue import UniqueLifoQueue
 from requests.exceptions import RequestException
 from name_subtitle import SubtitleTagType, FileWriteBehavior, name_subtitle
 from config import load_subtitle_tag_config
+import unicodedata
+from subtitle_event import SubtitleEventHandler
+from enum import Enum
 
 subgen_version = '2025.01.28'
 
@@ -56,7 +59,6 @@ concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 2))
 transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'cpu')
 procaddedmedia = convert_to_bool(os.getenv('PROCADDEDMEDIA', True))
 procmediaonplay = convert_to_bool(os.getenv('PROCMEDIAONPLAY', True))
-namesublang = os.getenv('NAMESUBLANG', '')
 webhookport = int(os.getenv('WEBHOOKPORT', 9000))
 word_level_highlight = convert_to_bool(os.getenv('WORD_LEVEL_HIGHLIGHT', False))
 debug = convert_to_bool(os.getenv('DEBUG', True))
@@ -77,41 +79,20 @@ use_model_prompt = os.getenv('USE_MODEL_PROMPT', False)
 custom_model_prompt = os.getenv('CUSTOM_MODEL_PROMPT', "")
 detect_language_length = int(os.getenv('DETECT_LANGUAGE_LENGTH', 30))
 detect_language_start_offset = int(os.getenv('DETECT_LANGUAGE_START_OFFSET', int(0)))
-skipifexternalsub = convert_to_bool(os.getenv('SKIPIFEXTERNALSUB', False))
-skip_if_to_transcribe_sub_already_exist = convert_to_bool(os.getenv('SKIP_IF_TO_TRANSCRIBE_SUB_ALREADY_EXIST', True))
-skipifinternalsublang = LanguageCode.from_iso_639_2(os.getenv('SKIPIFINTERNALSUBLANG', ''))
-skip_lang_codes_list = (
-    [LanguageCode.from_iso_639_2(code) for code in os.getenv("SKIP_LANG_CODES", "").split("|")]
-        if os.getenv('SKIP_LANG_CODES')
-    else []
-)
 force_detected_language_to = LanguageCode.from_iso_639_2(os.getenv('FORCE_DETECTED_LANGUAGE_TO', ''))
 preferred_audio_languages = ( 
     [LanguageCode.from_iso_639_2(code) for code in os.getenv('PREFERRED_AUDIO_LANGUAGES', 'eng').split("|")]
     if os.getenv('PREFERRED_AUDIO_LANGUAGES')
     else []
 ) # in order of preferrence
-limit_to_preferred_audio_languages = convert_to_bool(os.getenv('LIMIT_TO_PREFERRED_AUDIO_LANGUAGE', False))
-skip_if_audio_track_is_in_list = (
-    [LanguageCode.from_iso_639_2(code) for code in os.getenv('SKIP_IF_AUDIO_TRACK_IS', '').split("|")]
-    if os.getenv('SKIP_IF_AUDIO_TRACK_IS')
-    else []
-)
 subtitle_language_naming_type = os.getenv('SUBTITLE_LANGUAGE_NAMING_TYPE', 'ISO_639_2_B')
-only_skip_if_subgen_subtitle = convert_to_bool(os.getenv('ONLY_SKIP_IF_SUBGEN_SUBTITLE', False))
-skip_unknown_language = convert_to_bool(os.getenv('SKIP_UNKNOWN_LANGUAGE', False))
-skip_if_language_is_not_set_but_subtitles_exist = convert_to_bool(os.getenv('SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST', False))
-skip_if_language_is_not_set_but_subtitles_exist_in_prefered_language = convert_to_bool(os.getenv('SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST_IN_PREFERRED_LANGUAGE', False))
 should_whiser_detect_audio_language = convert_to_bool(os.getenv('SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False))
 ignore_folders = [folder.strip().lower() for folder in os.getenv('IGNORE_FOLDERS', '').split("|")]
 ignore_files = [file.strip().lower() for file in os.getenv('IGNORE_FILES', '').split("|")]
 should_write_detected_language = convert_to_bool(os.getenv('SHOULD_WRITE_DETECTED_LANGUAGE', False))
 jellyfin_stream_subtile = convert_to_bool(os.getenv('JELLYFIN_STREAM_SUBTITLE', True))
 word_highlight_color = os.getenv('WORD_HIGHLIGHT_COLOR', 'FFFF99')
-skip_if_preferred_audio_language_sub_already_exist = convert_to_bool(os.getenv('SKIP_IF_PREFERRED_AUDIO_LANGUAGE_SUB_ALREADY_EXIST', False))
 detect_language_in_filename = convert_to_bool(os.getenv('DETECT_LANGUAGE_IN_FILENAME', False))
-assume_no_language_in_subtitle_is_audio_language = convert_to_bool(os.getenv('ASSUME_NO_LANGUAGE_IN_SUBTITLE_IS_AUDIO_LANGUAGE', False))
-assume_default_in_subtitle_is_audio_language = convert_to_bool(os.getenv('ASSUME_DEFAULT_IN_SUBTITLE_IS_AUDIO_LANGUAGE', False))
 skip_list_file_name = os.getenv('SKIP_LIST_FILE_NAME', None)
 should_stream_subtitle = convert_to_bool(os.getenv('SHOULD_STREAM_SUBTITLE', False))
 segment_duration = int(os.getenv('SEGMENT_DURATION', 60 * 3))
@@ -123,6 +104,36 @@ jellyseer_transcribe_keyword = os.getenv('JELLYSEER_TRANSCRIBE_KEYWORD', None)
 jellyseer_translate_keyword = os.getenv('JELLYSEER_TRANSLATE_KEYWORD', None)
 subtitle_tags = None
 subtitle_tag_delimiter = os.getenv('SUBTITLE_TAG_DELIMITER', '.')
+jellyseerr_api_key = os.getenv('JELLYSEERR_API_KEY', None)
+jellyseerr_base_url = os.getenv('JELLYSEERR_BASE_URL', None)
+
+only_skip_if_subgen_subtitle = convert_to_bool(os.getenv('ONLY_SKIP_IF_SUBGEN_SUBTITLE', False))
+
+skip_unknown_language = convert_to_bool(os.getenv('SKIP_UNKNOWN_LANGUAGE', False))
+skip_if_language_is_not_set_but_subtitles_exist = convert_to_bool(os.getenv('SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST', False))
+skip_if_language_is_not_set_but_subtitles_exist_in_prefered_language = convert_to_bool(os.getenv('SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST_IN_PREFERRED_LANGUAGE', False))
+skip_if_preferred_audio_language_sub_already_exist = convert_to_bool(os.getenv('SKIP_IF_PREFERRED_AUDIO_LANGUAGE_SUB_ALREADY_EXIST', False))
+skip_if_any_subtitles_exist = convert_to_bool(os.getenv('SKIP_IF_SUBTITLES_EXIST', False))
+skip_if_to_transcribe_sub_already_exist = convert_to_bool(os.getenv('SKIP_IF_TO_TRANSCRIBE_SUB_ALREADY_EXIST', True))
+
+limit_to_preferred_audio_languages = convert_to_bool(os.getenv('LIMIT_TO_PREFERRED_AUDIO_LANGUAGE', False))
+skip_if_audio_track_is_in_list = (
+    [LanguageCode.from_iso_639_2(code) for code in os.getenv('SKIP_IF_AUDIO_TRACK_IS', '').split("|")]
+    if os.getenv('SKIP_IF_AUDIO_TRACK_IS')
+    else []
+)
+
+#TODO Do not use these and put a warning when using them
+assume_no_language_in_subtitle_is_audio_language = convert_to_bool(os.getenv('ASSUME_NO_LANGUAGE_IN_SUBTITLE_IS_AUDIO_LANGUAGE', False))
+assume_default_in_subtitle_is_audio_language = convert_to_bool(os.getenv('ASSUME_DEFAULT_IN_SUBTITLE_IS_AUDIO_LANGUAGE', False))
+skipifexternalsub = convert_to_bool(os.getenv('SKIPIFEXTERNALSUB', False))
+skipifinternalsublang = LanguageCode.from_iso_639_2(os.getenv('SKIPIFINTERNALSUBLANG', ''))
+namesublang = os.getenv('NAMESUBLANG', '')
+skip_lang_codes_list = (
+    [LanguageCode.from_iso_639_2(code) for code in os.getenv("SKIP_LANG_CODES", "").split("|")]
+        if os.getenv('SKIP_LANG_CODES')
+    else []
+)
 
 if not subtitle_tag_delimiter or subtitle_tag_delimiter == "":
     subtitle_tag_delimiter = ' '
@@ -313,10 +324,10 @@ def transcription_worker():
             if 'Bazarr-' in task['path']:
                 logging.info(f"Task {task['path']} is being handled by ASR.")
             if "type" in task and task["type"] == "detect_language":
-                detect_language_task(task['path'], task.get('skip_skip_check', False))
+                detect_language_task(task['path'], task.get('skip_skip_check', False), task.get('event_handler', None))
                 task_queue.task_done()  # Mark task as done if processing succeeded
             else:
-                gen_subtitles(task['path'], task['transcribe_or_translate'], task['force_language']) #TODO on translate subtitle should be in the english
+                gen_subtitles(task['path'], task['transcribe_or_translate'], task['force_language'], task.get('event_handler', None))
                 task_queue.task_done()
                 
         except queue.Empty:
@@ -502,6 +513,7 @@ def receive_plex_webhook(
 #also have something like a source like jellyseerr maybe so it can notify back that it has succedeed 
 @dataclass
 class MediaInfo:
+    jellyfin_id: str
     path: str
     audio_languages: List[LanguageCode] 
     subtitle_languages: List[LanguageCode] 
@@ -565,8 +577,12 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
         should_transcribe_or_translate = "transcribe"
     elif jellyseer_translate_keyword and jellyseer_translate_keyword in message:
         should_transcribe_or_translate = "translate"
-    # should_transcribe_or_translate = "translate"
+        
+    #TODO maybe make the default behaviour to do not skip skip check and only skip skip check when a keyword is present like "Force"
             
+    if jellyseerr_base_url and jellyseerr_api_key:
+        jellyseer_write_comment(issue_id, f"Received request to {should_transcribe_or_translate} subtitles from Jellyseerr", jellyseerr_api_key, jellyseerr_base_url)
+    
 
     # Should get is avalable too
 
@@ -583,8 +599,10 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
     
     is_movie = media_type == "movie"
     is_series = media_type == "tv"
-
-   
+    
+    send_feedback_to_jellyseerr = jellyseerr_api_key and jellyseerr_base_url
+    
+    #TODO send response when not fidning movie or series and ask for a tmdbid, tvdbid, imdbid, jellyfin_id or alternative title or fallback to folder filenamef
     #TODO handle the case where there are multiple versions of the same movie or episode (when one episode is requested)
     
     if is_movie:
@@ -596,9 +614,12 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                 force_language = movie.audio_languages[0]
             else:
                 force_language = next((language for language in movie.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
-            gen_subtitles_queue(path_mapping(movie.path), transcribe_or_translate, force_language, True)
+            gen_subtitles_queue_jellyseerr(movie, transcribe_or_translate, issue_id,force_language)
         else:
             logging.warning(f"Did not find movie for {subject}")
+            if send_feedback_to_jellyseerr:
+                jellyseer_write_comment(issue_id, "Did not find movie.", jellyseerr_api_key, jellyseerr_base_url)
+            
         return
     elif is_series:
         if len(payload.extra) > 0: # Empty if all seasons for tv
@@ -608,7 +629,7 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
             # if series check if one episode or one season or all seasons
             
             if season_nr and episode_nr:
-                # Single episode
+                # Single episodegen_subtitles_queue_jellyseerr
                 episode = get_series_episode_path_from_jellyfin(subject, tmdb_id, tvdb_id, season_nr, episode_nr, jellyfinserver, jellyfintoken)
                 if episode:
                     logging.info(f"Found episode: {episode}")
@@ -617,9 +638,11 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                         force_language = episode.audio_languages[0]
                     else:
                         force_language = next((language for language in episode.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
-                    gen_subtitles_queue(path_mapping(episode.path), should_transcribe_or_translate, force_language, True)
+                    gen_subtitles_queue_jellyseerr(episode, should_transcribe_or_translate, issue_id, force_language)
                 else:
                     logging.warning(f"Did not find episode {episode_nr} of season {season_nr} for {subject}")
+                    if send_feedback_to_jellyseerr:
+                        jellyseer_write_comment(issue_id, f"Did not find episode {episode_nr} of season {season_nr}", jellyseerr_api_key, jellyseerr_base_url)
             
             elif season_nr:
                 # Full season
@@ -633,11 +656,15 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                             force_language = episode.audio_languages[0]
                         else:
                             force_language = next((language for language in episode.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
-                        gen_subtitles_queue(path_mapping(episode.path), should_transcribe_or_translate, force_language, True)
+                        gen_subtitles_queue_jellyseerr(episode, should_transcribe_or_translate, issue_id, force_language)
                 else:
                     logging.warning(f"Did not find any episodes for season {season_nr} of {subject}")
+                    if send_feedback_to_jellyseerr:
+                        jellyseer_write_comment(issue_id, f"Did not find any episodes for season {season_nr}", jellyseerr_api_key, jellyseerr_base_url)
             else:
                 logging.warning(f"Expected at least Affected Season in payload extra when extra is not empty. Instead got this: {payload.extra}")
+                if send_feedback_to_jellyseerr:
+                    jellyseer_write_comment(issue_id, "Expected at least Affected Season in payload extra when extra is not empty.", jellyseerr_api_key, jellyseerr_base_url)
         
         else:
             # Full series
@@ -651,9 +678,11 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                         force_language = episode.audio_languages[0]
                     else:
                         force_language = next((language for language in episode.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
-                    gen_subtitles_queue(path_mapping(episode.path), should_transcribe_or_translate, force_language, True)
+                    gen_subtitles_queue_jellyseerr(episode, should_transcribe_or_translate, issue_id, force_language)
             else:
                 logging.warning(f"Did not find any episodes for {subject}")
+                if send_feedback_to_jellyseerr:
+                    jellyseer_write_comment(issue_id, "Did not find any episodes", jellyseerr_api_key, jellyseerr_base_url)
                 
 
     
@@ -666,12 +695,112 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
     # "EpisodeCount": 0,
     # "EpisodeTitle": "string",    
 
+    if send_feedback_to_jellyseerr:
+        jellyseer_write_comment(issue_id, "Added items to the queue, will comment again on updates and will mark issue as resolved when done", jellyseerr_api_key, jellyseerr_base_url)
+    
+
     logging.info(f"Finished processing jellyseerr webhook for {subject}")
 
     return {"status": "success", "message": "Webhook processed successfully."}
 
+def gen_subtitles_queue_jellyseerr(media: MediaInfo, 
+                                   transcription_type: str, 
+                                   issue_id,
+                                   force_language: LanguageCode = LanguageCode.NONE) -> None:
+        # Configure the event handler
+    subtitle_event_handler = SubtitleEventHandler(
+        shared_args={
+            'jellyseerr_api_key': jellyseerr_api_key,
+            'jellyseerr_base_url': jellyseerr_base_url,
+            'jellyseerr_issue_id': issue_id,
+            'jellyfin_api_key': jellyfintoken,
+            'jellyfin_base_url': jellyfinserver
+        },
+        on_start=jellyseer_write_comment,
+        on_update=jellyseer_write_comment,
+        on_error=jellyseer_write_comment,
+        on_skip=jellyseer_write_comment,
+        on_complete=[
+            jellyseer_write_comment,
+            jellyseer_mark_resolved,
+            (refresh_jellyfin_metadata, {'jellyfin_item_id': media.jellyfin_id})
+        ]
+    )
+    
+    gen_subtitles_queue(path_mapping(media.path), transcription_type, force_language, True, subtitle_event_handler)
+    return
 
+def jellyseer_write_comment(jellyseerr_issue_id: int, message: str, jellyseerr_api_key: str, jellyseerr_base_url: str = "localhost:5055"):
+    """
+    Sends a comment to a specific issue in Jellyseerr/Overseerr.
 
+    :param jellyseerr_issue_id: The ID of the issue to comment on.
+    :param message: The comment message.
+    :param jellyseerr_api_key: The API key for authentication.
+    :param jellyseerr_base_url: The base URL of the Jellyseerr/Overseerr server.
+    :return: A success message or error details.
+    """
+    if not (jellyseerr_api_key and jellyseerr_base_url):
+        logging.warning("No Jellyseerr/Overseerr API key or base URL provided.")
+        return
+    
+    logging.debug(f"Sending comment to Jellyseerr/Overseerr: {message}")
+    url = f"{jellyseerr_base_url}/api/v1/issue/{jellyseerr_issue_id}/comment"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Api-Key": jellyseerr_api_key
+    }
+    data = {"message": message}
+
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        response.raise_for_status()  # Raises an error for 4xx and 5xx status codes
+        
+        # Log the JSON response content
+        response_json = response.json()
+        # logging.debug(f"Response JSON: {response_json}")
+        
+        logging.info(f"Comment successfully sent to issue {jellyseerr_issue_id}")
+        return {"success": True, "message": "Comment sent successfully", "response": response_json}
+    
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending comment to issue {jellyseerr_issue_id}: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+def jellyseer_mark_resolved(jellyseerr_issue_id: int, jellyseerr_api_key: str, jellyseerr_base_url: str = "localhost:5055"):
+    """
+    Marks an issue as resolved in Jellyseerr/Overseerr.
+
+    :param jellyseerr_issue_id: The ID of the issue to mark as resolved.
+    :param jellyseerr_api_key: The API key for authentication.
+    :param jellyseerr_base_url: The base URL of the Jellyseerr/Overseerr server.
+    :return: A success message or error details.
+    """
+    if not (jellyseerr_api_key and jellyseerr_base_url):
+        logging.warning("No Jellyseerr/Overseerr API key or base URL provided.")
+        return
+    logging.debug(f"Marking issue {jellyseerr_issue_id} as resolved in Jellyseerr/Overseerr")
+    url = f"{jellyseerr_base_url}/api/v1/issue/{jellyseerr_issue_id}/resolved"
+    headers = {
+        "accept": "application/json",
+        "X-Api-Key": jellyseerr_api_key
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data="")  # Empty body
+        response.raise_for_status()  # Raises an error for 4xx and 5xx status codes
+        
+        # Log the JSON response content
+        response_json = response.json()
+        # logging.debug(f"Response JSON: {response_json}")
+        
+        logging.info(f"Issue {jellyseerr_issue_id} marked as resolved successfully")
+        return {"success": True, "message": "Issue marked as resolved", "response": response_json}
+    
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error marking issue {jellyseerr_issue_id} as resolved: {str(e)}")
+        return {"success": False, "error": str(e)}
 
 def _extract_media_info_from_source(source: dict) -> Optional[MediaInfo]:
     """Helper function to extract MediaInfo from a single media source."""
@@ -692,6 +821,7 @@ def _extract_media_info_from_source(source: dict) -> Optional[MediaInfo]:
     ]
     
     return MediaInfo(
+        jellyfin_id=source.get("Id"),
         path=path,
         audio_languages=audio_langs,
         subtitle_languages=subtitle_langs
@@ -711,6 +841,7 @@ def _extract_media_info_from_item(item: dict) -> Optional[MediaInfo]:
     path = item.get("Path")
     if path:
         return MediaInfo(
+            jellyfin_id=item.get("Id"),
             path=path,
             audio_languages=[],  # No language info available
             subtitle_languages=[]
@@ -915,11 +1046,8 @@ def get_series_season_episodes_paths_from_jellyfin(series_name: str, season_nr: 
         item_season_nr = item.get("ParentIndexNumber", None)
         item_series_id = item.get("SeriesId", None)
         
-        
         if not item_series_id == series_id:
             continue
-        
-            
         if not (item_season_nr == season_nr):
             continue
 
@@ -1001,22 +1129,11 @@ async def receive_jellyfin_webhook(
     
     if "Jellyfin-Server" in user_agent:
         logging.debug(f"Jellyfin event detected is: {NotificationType}")
-        
         file_path = path_mapping(get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken))
-        jellyfin_stream_subtile = True
-        procmediaonplay = True
-        if NotificationType == "PlaybackStart" and procmediaonplay and jellyfin_stream_subtile:
-            logging.info("Starting Jellyfin subtitle stream")
-            stream_subtitle_to_jellyfin(file_path, jellyfin_movie_id=ItemId, jellyfin_session_id=Id, language=LanguageCode.from_iso_639_2(Audio_0_Language), segment_duration=60 * 3)
-
-        elif (NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay):
+        if (NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay):
             logging.debug(f"Adding item from Jellyfin to the queue: {file_path}")
+            #TODO refresh jellyfin metadata after transcribing
             gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate)
-            try:
-                refresh_jellyfin_metadata(ItemId, jellyfinserver, jellyfintoken)
-                logging.info(f"Metadata for item {ItemId} refreshed successfully.")
-            except Exception as e:
-                logging.error(f"Failed to refresh metadata for item {ItemId}: {e}")
         else:
             logging.info(f"Skipping Jellyfin event: {NotificationType}")
     else:
@@ -1179,7 +1296,7 @@ async def detect_language(
 
         return {"detected_language": detected_language.to_name(), "language_code": language_code}
 
-def detect_language_task(path, skip_skip_check = False):
+def detect_language_task(path, skip_skip_check = False, event_handler: Optional[SubtitleEventHandler] = None):
     detected_language = LanguageCode.NONE
     global detect_language_length 
 
@@ -1257,10 +1374,12 @@ def detect_language_task(path, skip_skip_check = False):
 
         if  detected_language:
             logging.info(f"[Detect language task] Detected language of file: {os.path.basename(path)} is: {detected_language.to_name()}. Will add it to the gen subtitles queue")
-            gen_subtitles_queue(path, transcribe_or_translate, force_language=detected_language, skip_skip_check=skip_skip_check)
+            if event_handler: 
+                event_handler.on_detected_language(message=f"Detected language: {detected_language.to_name()}")
+            gen_subtitles_queue(path, transcribe_or_translate, force_language=detected_language, skip_skip_check=skip_skip_check, event_handler=event_handler)
     
     except Exception as e:
-        logging.error(f"[Detect language task] Error detectign language of file with whisper: {e}")
+        logging.error(f"[Detect language task] Error detecting language of file with whisper: {e}")
         
 
 
@@ -1483,7 +1602,10 @@ def get_updated_subtitle_tags(subtitle_tags, language = None):
             current_subtitle_tags.append(updated_tag)
     return current_subtitle_tags
 
-def gen_subtitles(file_path: str, transcription_type: str, force_language : LanguageCode = LanguageCode.NONE) -> None:
+def gen_subtitles(file_path: str, 
+                  transcription_type: str, 
+                  force_language : LanguageCode = LanguageCode.NONE, 
+                  event_handler: Optional[SubtitleEventHandler] = None) -> None:
     """Generates subtitles for a video file.
 
     Args:
@@ -1495,6 +1617,11 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language : Lang
     try:
         logging.info(f"Preparing to transcribe file: {os.path.basename(file_path)} in {force_language if force_language else 'Unkown Language'}")
 
+        if event_handler:
+            event_handler.on_start(message=f"Started to {transcription_type}: {os.path.basename(file_path)} in {force_language if force_language else 'Unkown Language'}")
+        else:
+            logging.warning("SubtitleEventHandler is None")
+        
         start_time = time.time()
         start_model()
         
@@ -1527,7 +1654,7 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language : Lang
         # transcription_prompt = "This audio contains a dialogue from a movie. Please transcribe the spoken dialogue clearly and include any significant non-verbal sounds like music, laughter, sound effects, or background noises that may be important to understanding the context. Ensure that the transcription is complete and provides all meaningful audio content, such as identifying who is speaking, as well as key sounds or music cues."
         transcription_prompt = ""
         if use_model_prompt and custom_model_prompt != "":
-            initial_prompt = custom_model_prompt
+            transcription_prompt = custom_model_prompt
 
         #     #TODO STREAMING MODE WITH JELLYFIN INTEGRATION, 
         #     #TODO OPTIONALLY ADD MESSAGE AFTER CHUNK IN SUBTITLE THAT IT IS STILL GENERATING. AND DELETE THAT MESSAGE WHEN THE NEXT CHUNK IS READY, BUT DO NOT PUT THE MESSSAGE WHEN IT DID ALL CHUNKS
@@ -1565,7 +1692,7 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language : Lang
                 
             # If it is an audio file, write the LRC file
             if is_audio_file and lrc_for_audio_files:
-                # todouse denoiser="demucs" and vad=True for music
+                #TODO us optionally denoiser="demucs" and vad=True for music
                 write_lrc(result, file_name + '.lrc')
                 
                 # maybe add support for this https://en.wikipedia.org/wiki/LRC_(file_format)
@@ -1591,11 +1718,22 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language : Lang
         logging.warning(f"Error processing or transcribing {file_path} in {force_language}: {e}")
         
         logging.warning(traceback.format_exc())
+        if event_handler:
+            event_handler.on_error(message=f"Error {transcription_type} {file_path} in {force_language}: {e}")
+        else:
+            logging.warning("SubtitleEventHandler is None")
         
 
     finally:
         if skip_list_file_name:
             write_to_skip_list(skip_list_file_name, file_path)
+        
+        # Execute the on_complete action if provided
+        if event_handler:
+            event_handler.on_complete(message="Completed task!") #TODO change this to include the subtitle file name or just the tags
+        else:
+            logging.warning("SubtitleEventHandler is None")
+            
         delete_model()
 
 def handle_multiple_audio_tracks(file_path: str, language: LanguageCode | None = None) -> io.BytesIO | None:
@@ -1757,17 +1895,8 @@ def extract_audio_track_to_memory(input_video_path, track_index) -> io.BytesIO |
     
 def transcribe_chunk(chunk_audio, language: LanguageCode, transcription_prompt = "", transcription_type = "transcribe", **args):
     # # Convert in-memory audio chunk to a format stable-ts can handle (e.g., wav)
-    # audio_chunk_io = io.BytesIO()
-    # audio_chunk_io.write(chunk_audio)  # Write the chunk data to the in-memory buffer
-    # audio_chunk_io.seek(0)  # Reset the pointer to the beginning
-    
-    # Transcribe using the model
-    
-    # transcription = model.transcribe_stable(audio_chunk_io.read(), language=language.to_iso_639_1(), initial_prompt="", task=transcription_type, vad=True, suppress_silence=True, **args) # , beam_size=5
+
     transcription = model.transcribe_stable(chunk_audio, language=language.to_iso_639_1(), initial_prompt=transcription_prompt, task=transcription_type, **args) # , beam_size=5
-    # if transcription_prompt:
-    #     # Remove the first segment which is the transcription prompt
-    #     transcription.remove_segment(transcription[0])
                 
     return transcription  # Return the transcription object
 
@@ -1894,7 +2023,7 @@ def choose_transcribe_language(file_path, forced_language: LanguageCode):
         determined.
     """
     
-    logger.debug(f"choose_transcribe_language({file_path}, {forced_language})")
+    # logger.debug(f"choose_transcribe_language({file_path}, {forced_language})")
     
     if force_detected_language_to:
         logger.debug(f"ENV FORCE_DETECTED_LANGUAGE_TO is set: Forcing detected language to {force_detected_language_to}")
@@ -2056,28 +2185,63 @@ def find_default_audio_track_language(audio_tracks):
         if track['default'] is True:
             return track['language']
     return None
+
+class SkipReason(Enum):
+    # File related
+    UNVALID_PATH = "File path is not valid"
     
+    # Audio related
+    NO_AUDIO = "File has no audio to transcribe"
+    UNKNOWN_LANGUAGE = "Audio language is unknown"
+    NON_PREFERRED_AUDIO_LANGUAGE = "Audio language is not in preferred languages"
+    AUDIO_LANGUAGE_IN_SKIP_LIST = "Audio language is in skip list"
     
-def gen_subtitles_queue(file_path: str, transcription_type: str, force_language: LanguageCode = LanguageCode.NONE, skip_skip_check = False) -> None:
+    # Subtitle related
+    PREFERRED_LANGUAGE_SUB_EXISTS = "Subtitles already exist in preferred language"
+    INTERNAL_SUB_EXISTS = "Internal subtitles already exist"
+    EXTERNAL_SUB_EXISTS = "External subtitles already exist"
+    TARGET_LANGUAGE_SUB_EXISTS = "Subtitles already exist in target language"
+    SKIP_LISTED_LANGUAGE_SUB_EXISTS = "Subtitles exist in a skip-listed language"
+    GENERIC_SUB_EXISTS = "Subtitles already exist"
+    
+    # Language preferences
+    FORCE_LANGUAGE_NOT_PREFERRED = "Forced language is not in preferred languages"
+    
+def gen_subtitles_queue(file_path: str, 
+                        transcription_type: str, 
+                        force_language: LanguageCode = LanguageCode.NONE, 
+                        skip_skip_check = False, 
+                        event_handler: Optional[SubtitleEventHandler] = None) -> None:
     global task_queue
     
-    logging.debug(f"gen_subtitles_queue({file_path}, {transcription_type}, {force_language}, {skip_skip_check})")
+    # logging.debug(f"gen_subtitles_queue({file_path}, {transcription_type}, {force_language}, {skip_skip_check})")
     
     if not is_valid_path(file_path):
-        logging.warning(f"{file_path} is not a valid path")
+        message = f"Skipping {file_path}. {SkipReason.UNVALID_PATH.value}."
+        logging.warning(message)
+        if event_handler:
+            event_handler.on_error(message=message)
         return
         
     
     if not has_audio(file_path):
-        logging.warning(f"{file_path} doesn't have any audio to transcribe!")
+        message= f"Skipping {os.path.basename(file_path)}. {SkipReason.NO_AUDIO.value}."
+        logging.warning(message)
+        if event_handler:
+            event_handler.on_error(message=message)
         return
     
     
-    if not skip_skip_check and have_to_skip_before_choosing_language(file_path, force_language):
-        logging.info(f"Skipping: {os.path.basename(file_path)}")
-        if skip_list_file_name:
-            write_to_skip_list(skip_list_file_name, file_path)
-        return
+    if not skip_skip_check:
+        skip_reason = have_to_skip_before_choosing_language(file_path, force_language)
+        if skip_reason:
+            message = f"Skipping {os.path.basename(file_path)}. {skip_reason.value}."
+            logging.debug(message)
+            if skip_list_file_name:
+                write_to_skip_list(skip_list_file_name, file_path)
+            if event_handler:
+                event_handler.on_skip(message=message)
+            return
 
     
     force_language = choose_transcribe_language(file_path, force_language)
@@ -2085,63 +2249,68 @@ def gen_subtitles_queue(file_path: str, transcription_type: str, force_language:
     # check if we would like to detect audio language in case of no audio language specified. Will return here again with specified language from whisper. #TODO Probably should make a function from what's down here and just call that instead.
     if not force_language and should_whiser_detect_audio_language:
         # make a detect language task
-        task_id = { 'path': file_path, 'type': "detect_language", 'skip_skip_check': skip_skip_check}
+        task_id = { 'path': file_path, 'type': "detect_language", 'skip_skip_check': skip_skip_check, 'event_handler': event_handler }
         task_queue.put(task_id)
         logging.debug(f"task_queue.put(task_id)({file_path}, detect_language)")
         return
     
     
-    if not skip_skip_check and have_to_skip(file_path, force_language):
-        logging.debug(f"Skipping: {os.path.basename(file_path)}")
-        if skip_list_file_name:
-            write_to_skip_list(skip_list_file_name,file_path)
-        return
+    if not skip_skip_check:
+        skip_reason =have_to_skip(file_path, force_language)
+        if skip_reason:
+            message = f"Skipping {os.path.basename(file_path)}. {skip_reason.value}."
+            logging.debug(message)
+            if skip_list_file_name:
+                write_to_skip_list(skip_list_file_name,file_path)
+            if event_handler:
+                event_handler.on_skip(message=message)
+            return
     
     task = {
         'path': file_path,
         'transcribe_or_translate': transcription_type,
-        'force_language': force_language
+        'force_language': force_language,
+        'event_handler': event_handler
     }
     task_queue.put(task)
+    
     logging.info(f"Added to queue: [{transcription_type}] {force_language} {os.path.basename(file_path)}")
 
-def have_to_skip_before_choosing_language(file_path: str, force_language: LanguageCode) -> bool:
+def have_to_skip_before_choosing_language(file_path: str, force_language: LanguageCode) -> Optional[SkipReason]:
+    """
+    Checks if a file should be skipped before language selection process.
     
+    Args:
+        file_path: Path to the media file
+        force_language: Forced language code if specified
+        
+    Returns:
+        SkipReason if file should be skipped, None otherwise
+    """
+    # Check forced language against preferences
     if force_language and limit_to_preferred_audio_languages:
         if force_language not in preferred_audio_languages:
-            logging.debug(f"Skipping {file_path} because {force_language} is not in the preferred languages")
-            return True
+            return SkipReason.FORCE_LANGUAGE_NOT_PREFERRED
     
-    if skip_if_preferred_audio_language_sub_already_exist and check_if_preferred_audio_language_sub_already_exist(file_path):
-        return True
+    # Check for existing subtitles
     
+    #TODO return all subtitles_languages
+    subtitle_exists, subtitle_langauges = check_subtitles(file_path, LanguageCode.NONE, require_subgen=only_skip_if_subgen_subtitle)
     
-    # Check if subtitles in the specified internal language(s) should skip processing
-    # TODO should remove this without breaking backwards compatibility
-    if skipifinternalsublang and has_subtitle_language(file_path, skipifinternalsublang):
-        logging.debug(f"{file_path} has internal subtitles matching skip condition, skipping.")
-        return True
+    if not subtitle_exists:
+        return None
+    elif skip_if_any_subtitles_exist:
+        return SkipReason.GENERIC_SUB_EXISTS
+    elif skip_if_preferred_audio_language_sub_already_exist:
+            if any(language in preferred_audio_languages for language in subtitle_langauges):
+                return SkipReason.PREFERRED_LANGUAGE_SUB_EXISTS
+        
+    
+    #Removed skipifexternalsub, namesublang, skipifinternalsublang, skip_lang_codes_list
+    #TODO implement assume_default_in_subtitle_is_audio_language, assume_no_language_in_subtitle_is_audio_language
+    
 
-    # Check if external subtitles exist for the specified language
-    # Probably not use LanguageCode for this, but just check with strings, to be able to skip with custom named languages. 
-    if LanguageCode.is_valid_language(namesublang):
-        if skipifexternalsub and has_subtitle_language(file_path, LanguageCode.from_string(namesublang)):
-            logging.debug(f"{file_path} has external subtitles in {namesublang}, skipping.")
-            return True
-
-    # Skip if any language in the skip list is detected in existing subtitles
-    existing_sub_langs = get_subtitle_languages(file_path)
-    if any(lang in skip_lang_codes_list for lang in existing_sub_langs):
-        logging.debug(f"Languages in skip list {skip_lang_codes_list} detected in {file_path}, skipping.")
-        return True
-    
-    #TODO check here if subtitles exist for no language/ default probably
-    if has_subtitle_language(file_path):
-        #TODO maybe use another function for this to check for subtitles without knowing the target language
-        logging.debug(f"{file_path} already has subtitles, skipping.")
-        return True
-    return False
-    
+    return None
 
 def check_if_preferred_audio_language_sub_already_exist(file_path: str) -> bool:
     
@@ -2152,64 +2321,190 @@ def check_if_preferred_audio_language_sub_already_exist(file_path: str) -> bool:
         
     return False
 
-def have_to_skip(file_path: str, transcribe_language: LanguageCode ) -> bool:
+def have_to_skip(file_path: str, transcribe_language: LanguageCode) -> Optional[SkipReason]:
     """
-    Determines whether subtitle generation should be skipped for a given file.
+    Determines whether subtitle generation should be skipped for a given file
+    after language selection.
 
     Args:
-        file_path: The path to the file to check for existing subtitles.
-        transcribe_language: The language intended for transcription.
+        file_path: The path to the file to check for existing subtitles
+        transcribe_language: The language intended for transcription
 
     Returns:
-        True if subtitle generation should be skipped; otherwise, False.
+        SkipReason if subtitle generation should be skipped; otherwise None
     """
-        
     if not transcribe_language:
         if skip_unknown_language:
-            logging.debug(f"{file_path} has unknown language, skipping.")
-            return True
-        if has_subtitle_language(file_path):
-            #TODO maybe use another function for this to check for subtitles without knowing the target language
-            logging.debug(f"{file_path} already has subtitles, skipping.")
-            return True
+            return SkipReason.UNKNOWN_LANGUAGE
+            
         
-        audio_langs = get_audio_languages(file_path)
-        if any(language in preferred_audio_languages for language in audio_langs):
-            logging.debug(f"Preferred audio language {preferred_audio_languages} detected in {file_path}.")
-            # maybe not skip if subtitle exist in preferred audio language, but not in another preferred audio language if the file has multiple audio tracks matching the preferred audio languages
+        subtitles_exist, subtitle_languages = check_subtitles(file_path, LanguageCode.NONE, require_subgen=only_skip_if_subgen_subtitle)
+        
+        if not subtitles_exist:
+            # Won't skip if no subtitle is found
+            return None
         else:
-            if limit_to_preferred_audio_languages:
+            if skip_if_language_is_not_set_but_subtitles_exist:
+                return SkipReason.GENERIC_SUB_EXISTS
+        
+        
+        if skip_if_language_is_not_set_but_subtitles_exist_in_prefered_language:
+            if any(language in preferred_audio_languages for language in subtitle_languages):
+                return SkipReason.PREFERRED_LANGUAGE_SUB_EXISTS
+            
                 
-                logging.debug(f"Only non-preferred audio language {audio_langs} detected in {file_path}, skipping.")
-                return True
+        # Check for a reason based on the audio languages
+        audio_langs = get_audio_languages(file_path)
+        
+        if not any(language in preferred_audio_languages for language in audio_langs):
+            if limit_to_preferred_audio_languages:
+                return SkipReason.NON_PREFERRED_AUDIO_LANGUAGE
+                
             if any(lang in skip_if_audio_track_is_in_list for lang in audio_langs):
-                logging.debug(f"Audio language in skip list {skip_if_audio_track_is_in_list} detected in {file_path}, skipping.")
-                return True
-        
+                return SkipReason.AUDIO_LANGUAGE_IN_SKIP_LIST
     else:
-        # Check on these conditions only if the transcribe language is not NONE
-    
-        #if transcribing only certain languages there's no need to check for other conditions on skipping if the to transcribe language is not in the list
+        # Handle cases where transcription language is specified
         if limit_to_preferred_audio_languages and transcribe_language not in preferred_audio_languages:
-            logging.debug(f"{file_path} is not in preferred audio languages, skipping.")
-            return True
+            return SkipReason.NON_PREFERRED_AUDIO_LANGUAGE
     
-        # Check if subtitles in the desired transcription language already exist
-        if skip_if_to_transcribe_sub_already_exist and has_subtitle_language(file_path, transcribe_language):
-            logging.debug(f"{file_path} already has subtitles in {transcribe_language}, skipping.")
-            return True
+        # Check for existing subtitles in target language
+        if skip_if_to_transcribe_sub_already_exist:
+            subtitles_exist, subtitle_language = check_subtitles(file_path, transcribe_language, require_subgen=only_skip_if_subgen_subtitle)
+            
+            if not subtitles_exist:
+                # Do not skip if no subtitle is found
+                return None
+            # else the subtitle already exists so we can skip it
+            return SkipReason.TARGET_LANGUAGE_SUB_EXISTS
 
-        # if transcribe_language is something, we don't need to check the audio languages
+        # Additional language preference checks
         if transcribe_language not in preferred_audio_languages and limit_to_preferred_audio_languages:
-            return True
+            return SkipReason.NON_PREFERRED_AUDIO_LANGUAGE
+            
         if transcribe_language in skip_if_audio_track_is_in_list:
-            return True
-        logging.debug(f"Audio language {transcribe_language} is not a reason to skip in {file_path}.")
-        
+            return SkipReason.AUDIO_LANGUAGE_IN_SKIP_LIST
 
-    # If none of the conditions matched, do not skip
-    logging.debug(f"Not skipping {file_path}. No conditions met to skip.")
-    return False
+    return None
+
+
+def check_subtitles(video_file: str, target_language: Union[LanguageCode, List[LanguageCode]], require_subgen: bool = False) -> Tuple[bool, Optional[List[LanguageCode]]]:
+    """
+    Combined function to check for both internal and external subtitles in a video file.
+    Returns whether subtitles exist, their languages if found, and if they're subgen subtitles (for external subtitles).
+    
+    Args:
+        video_file: The path to the video file
+        target_language: The language or list of languages to check for, or NONE to check for any
+        require_subgen: Whether to require subgen subtitles (only applies to external subtitles)
+        
+    Returns:
+        tuple[bool, Optional[List[LanguageCode]]]: 
+            (subtitles_exist, detected_languages)
+    """
+    detected_languages = []
+
+    # Normalize target_language to a list
+    if not isinstance(target_language, list):
+        target_language = [target_language] if target_language != LanguageCode.NONE else []
+
+    if not require_subgen:
+        # Don't check internal subtitles if we require subgen subtitles
+        # Check internal subtitles first
+        internal_exists, internal_languages = check_internal_subtitles(video_file, target_language)
+        if internal_exists:
+            detected_languages.extend(internal_languages)
+
+    # If no internal subtitles, check external subtitles
+    external_exists, external_languages = check_external_subtitles(video_file, target_language, require_subgen)
+    if external_exists:
+        detected_languages.extend(external_languages)
+
+    # No subtitles found
+    return bool(detected_languages), detected_languages if detected_languages else None
+
+def check_external_subtitles(video_file: str, target_language: List[LanguageCode], require_subgen: bool = False) -> Tuple[bool, Optional[List[LanguageCode]]]:
+    """
+    Core function to check for external subtitle files.
+    Returns whether subtitles exist, their languages if found, and if they're subgen subtitles.
+    
+    Args:
+        video_file: The path to the video file
+        target_language: The list of languages to check for, or empty list to check for any
+        require_subgen: Whether to require subgen subtitles
+        
+    Returns:
+        tuple[bool, Optional[List[LanguageCode]]]: (subtitles_exist, detected_languages)
+    """
+    video_file_stripped = os.path.splitext(os.path.split(video_file)[1])[0]
+    folder_path = os.path.dirname(video_file)
+    detected_languages = []
+
+    for file_name in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file_name)
+        
+        if os.path.isfile(file_path):
+            root, ext = os.path.splitext(file_name)
+            if root.startswith(video_file_stripped) and ext.lower() in SUBTITLE_EXTENSIONS:
+                identifier_string = root[len(video_file_stripped):]
+                
+                is_subgen = has_word_in_string(identifier_string, "subgen")
+                is_default = has_word_in_string(identifier_string, "default")
+                
+                if require_subgen and not is_subgen:
+                    continue
+                
+                if is_default:
+                    detected_languages.append(None)
+                    continue
+                    
+                subtitle_language = find_language_in_string(identifier_string)
+                if subtitle_language:
+                    if not target_language or subtitle_language in target_language:
+                        detected_languages.append(subtitle_language)
+                    else:
+                        detected_languages.append(None)
+                    
+    return bool(detected_languages), detected_languages if detected_languages else None
+
+def check_internal_subtitles(video_file: str, target_language: List[LanguageCode]) -> Tuple[bool, Optional[List[LanguageCode]]]:
+    """
+    Core function to check for internal subtitles in a video file.
+    Returns whether subtitles exist and their languages if found.
+    
+    Args:
+        video_file: The path to the video file
+        target_language: The list of languages to check for, or empty list to check for any
+        
+    Returns:
+        tuple[bool, Optional[List[LanguageCode]]]: (subtitles_exist, detected_languages)
+    """
+    detected_languages = []
+
+    try:
+        with av.open(video_file) as container:
+            subtitle_streams = [s for s in container.streams if s.type == 'subtitle']
+            
+            if not subtitle_streams:
+                return False, None
+                
+            for subtitle_stream in subtitle_streams:
+                if 'language' in subtitle_stream.metadata:
+                    subtitle_language = LanguageCode.from_iso_639_2(subtitle_stream.metadata.get('language'))
+                    if subtitle_language:
+                        if not target_language or subtitle_language in target_language:
+                            detected_languages.append(subtitle_language)
+                    else:
+                        logging.warning(f"Unsupported subtitle language code: {subtitle_stream.metadata.get('language')} in {video_file}")
+                else:
+                    # Subtitle exists but has no language tag
+                    detected_languages.append(None)
+                    
+            return bool(detected_languages), detected_languages if detected_languages else None
+            
+    except Exception as e:
+        logging.error(f"Error checking internal subtitles in {os.path.basename(video_file)}: {str(e)}")
+        logging.error(traceback.format_exc())
+        return False, None
 
 def get_string_after_year(text: str) -> str:
     DELIMITERS = {'.': '.', '(': ')', ' ': ' '}
@@ -2532,25 +2827,25 @@ def refresh_plex_metadata(itemid: str, server_ip: str, plex_token: str) -> None:
     else:
         raise Exception(f"Error refreshing metadata: {response.status_code}")
 
-def refresh_jellyfin_metadata(itemid: str, server_ip: str, jellyfin_token: str) -> None:
+def refresh_jellyfin_metadata(jellyfin_item_id: str, jellyfin_base_url: str, jellyfin_api_key: str) -> None:
     """
     Refreshes the metadata of a Jellyfin library item.
     
     Args:
-        itemid: The ID of the item in the Jellyfin library whose metadata needs to be refreshed.
-        server_ip: The IP address of the Jellyfin server.
-        jellyfin_token: The Jellyfin token used for authentication.
+        jellyfin_item_id: The ID of the item in the Jellyfin library whose metadata needs to be refreshed.
+        jellyfin_base_url: The IP address of the Jellyfin server.
+        jellyfin_api_key: The Jellyfin token used for authentication.
         
     Raises:
         Exception: If the server does not respond with a successful status code.
     """
 
     # Jellyfin API endpoint to refresh metadata for a specific item
-    url = f"{server_ip}/Items/{itemid}/Refresh"
+    url = f"{jellyfin_base_url}/Items/{jellyfin_item_id}/Refresh"
 
     # Headers to include the Jellyfin token for authentication
     headers = {
-        "Authorization": f"MediaBrowser Token={jellyfin_token}",
+        "Authorization": f"MediaBrowser Token={jellyfin_api_key}",
     }
     
     # Query parameters
@@ -2558,11 +2853,6 @@ def refresh_jellyfin_metadata(itemid: str, server_ip: str, jellyfin_token: str) 
         "metadataRefreshMode": "FullRefresh",
     }
 
-    # # Cheap way to get the admin user id, and save it for later use.
-    # users = json.loads(requests.get(f"{server_ip}/Users", headers=headers).content)
-    # jellyfin_admin = get_jellyfin_admin(users)
-
-    # response = requests.get(f"{server_ip}/Users/{jellyfin_admin}/Items/{itemid}/Refresh", headers=headers)
 
     # Sending the PUT request to refresh metadata
     response = requests.post(url, headers=headers, params=params)
@@ -2704,11 +2994,11 @@ if monitor:
                 if any(ignore_folders):
                     event_folder = os.path.dirname(event.src_path)  # Get the directory of the created/modified file
                     if self._is_subfolder(event_folder) and self._is_ignored_folder(event_folder):
-                        logging.info(f"[Monitor] Excluding folder: {event_folder} due to ignore_folders criteria.")
+                        logging.debug(f"[Monitor] Excluding folder: {event_folder} due to ignore_folders criteria.")
                         return False
                 if any(ignore_files):
                     if any(keyword in file_name.lower() for keyword in ignore_files):
-                        logging.info(f"[Monitor] Excluding file: {file_path} due to ignore_files criteria.")
+                        logging.debug(f"[Monitor] Excluding file: {file_path} due to ignore_files criteria.")
                         return False
                 
                 if has_audio(file_path):
@@ -2819,13 +3109,13 @@ def process_file(file_path, ignore_files):
         return
     
     if is_ignored_file(file_name, ignore_files):
-        logger.debug(f"Excluding file: {file_path} due to ignore_files criteria.")
+        # logger.debug(f"Excluding file: {file_path} due to ignore_files criteria.")
         return
     
     #Maybe check first if if has an video/audio file exension before checking this list and then check if it has audio with the av probe. Not sure what would be better
     
     if file_path in files_to_skip_list:
-        logger.debug(f"Excluding file: {file_path} due to skip list.")
+        # logger.debug(f"Excluding file: {file_path} due to skip list.")
         return
 
     if is_valid_audio_file(file_path, check_extensions = False):
@@ -2932,7 +3222,7 @@ if __name__ == "__main__":
         server_thread = threading.Thread(target=run_uvicorn, daemon=True, name="uvicorn_server")
         server_thread.start()
 
-    subtitle_tags = load_subtitle_tag_config(os.getenv('SUBTITLE_TAGS', ''), whisper_model=whisper_model.split('.')[0], subtitle_language_naming_type=subtitle_language_naming_type, language=namesublang if namesublang else (LanguageCode.ENGLISH if transcribe_or_translate == "translate" else force_detected_language_to))
+    subtitle_tags = load_subtitle_tag_config(os.getenv('SUBTITLE_TAGS', ''), whisper_model=whisper_model.split('.')[0], subtitle_language_naming_type=subtitle_language_naming_type, language=namesublang if namesublang else (LanguageCode.ENGLISH if transcribe_or_translate == "translate" else (force_detected_language_to if force_detected_language_to else LanguageCode.ENGLISH)))
 
 
     logging.info("Setup complete!")
