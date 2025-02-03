@@ -41,9 +41,12 @@ from config import load_subtitle_tag_config
 import unicodedata
 from subtitle_event import SubtitleEventHandler
 from enum import Enum
+from load_env_variables import load_env_variables
 
 subgen_version = '2025.01.28'
 
+
+load_env_variables()
 
 def convert_to_bool(in_bool):
     # Convert the input to string and lower case, then check against true values
@@ -408,7 +411,7 @@ def progress(seek, total):
         global last_print_time
         # Get the current time
         current_time = time.time()
-    
+
         # Check if 5 seconds have passed since the last print
         if last_print_time is None or (current_time - last_print_time) >= 5:
             # Update the last print time
@@ -572,16 +575,27 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
         )
         
     should_transcribe_or_translate = transcribe_or_translate
-        
-    if jellyseer_transcribe_keyword and jellyseer_transcribe_keyword in message:
-        should_transcribe_or_translate = "transcribe"
-    elif jellyseer_translate_keyword and jellyseer_translate_keyword in message:
-        should_transcribe_or_translate = "translate"
+    
+    if (jellyseer_transcribe_keyword or jellyseer_translate_keyword):  
+        if jellyseer_transcribe_keyword and jellyseer_transcribe_keyword in message:
+            should_transcribe_or_translate = "transcribe"
+        elif jellyseer_translate_keyword and jellyseer_translate_keyword in message:
+            should_transcribe_or_translate = "translate"
+        else:
+            #Did not find required keyword in message
+            message = f"Did not find required keyword {jellyseer_transcribe_keyword or jellyseer_translate_keyword} in message: {message}. Subgen will ignore this request"
+            logging.debug("[jellyseerr-webhook] {message}")
+            jellyseer_write_comment(issue_id, message, jellyseerr_api_key, jellyseerr_base_url)
+            return
+     
+    
         
     #TODO maybe make the default behaviour to do not skip skip check and only skip skip check when a keyword is present like "Force"
             
     if jellyseerr_base_url and jellyseerr_api_key:
-        jellyseer_write_comment(issue_id, f"Received request to {should_transcribe_or_translate} subtitles from Jellyseerr", jellyseerr_api_key, jellyseerr_base_url)
+        message = "Received request to {should_transcribe_or_translate} subtitles from {reported_by_username}"
+        logging.debug("[jellyseerr-webhook] {message}")
+        jellyseer_write_comment(issue_id, f"Received request to {should_transcribe_or_translate} subtitles from {reported_by_username}", jellyseerr_api_key, jellyseerr_base_url)
     
 
     # Should get is avalable too
@@ -616,7 +630,7 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                 force_language = next((language for language in movie.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
             gen_subtitles_queue_jellyseerr(movie, transcribe_or_translate, issue_id,force_language)
         else:
-            logging.warning(f"Did not find movie for {subject}")
+            logging.warning(f"Did not find movie for {subject} on jellyfin.")
             if send_feedback_to_jellyseerr:
                 jellyseer_write_comment(issue_id, "Did not find movie.", jellyseerr_api_key, jellyseerr_base_url)
             
@@ -640,7 +654,7 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                         force_language = next((language for language in episode.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
                     gen_subtitles_queue_jellyseerr(episode, should_transcribe_or_translate, issue_id, force_language)
                 else:
-                    logging.warning(f"Did not find episode {episode_nr} of season {season_nr} for {subject}")
+                    logging.warning(f"Did not find episode {episode_nr} of season {season_nr} for {subject} on jellyfin.")
                     if send_feedback_to_jellyseerr:
                         jellyseer_write_comment(issue_id, f"Did not find episode {episode_nr} of season {season_nr}", jellyseerr_api_key, jellyseerr_base_url)
             
@@ -658,7 +672,7 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
                             force_language = next((language for language in episode.audio_languages if language in preferred_audio_languages), LanguageCode.NONE)
                         gen_subtitles_queue_jellyseerr(episode, should_transcribe_or_translate, issue_id, force_language)
                 else:
-                    logging.warning(f"Did not find any episodes for season {season_nr} of {subject}")
+                    logging.warning(f"Did not find any episodes for season {season_nr} of {subject} on jellyfin.")
                     if send_feedback_to_jellyseerr:
                         jellyseer_write_comment(issue_id, f"Did not find any episodes for season {season_nr}", jellyseerr_api_key, jellyseerr_base_url)
             else:
@@ -682,7 +696,7 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
             else:
                 logging.warning(f"Did not find any episodes for {subject}")
                 if send_feedback_to_jellyseerr:
-                    jellyseer_write_comment(issue_id, "Did not find any episodes", jellyseerr_api_key, jellyseerr_base_url)
+                    jellyseer_write_comment(issue_id, "Did not find any episodes on jellyfin", jellyseerr_api_key, jellyseerr_base_url)
                 
 
     
@@ -696,7 +710,7 @@ async def receive_jellyseerr_webhook(payload: Optional[JellyseerWebhookPayload] 
     # "EpisodeTitle": "string",    
 
     if send_feedback_to_jellyseerr:
-        jellyseer_write_comment(issue_id, "Added items to the queue, will comment again on updates and will mark issue as resolved when done", jellyseerr_api_key, jellyseerr_base_url)
+        jellyseer_write_comment(issue_id, "Added items to the queue, will comment again on updates and will mark issue as resolved when done.", jellyseerr_api_key, jellyseerr_base_url)
     
 
     logging.info(f"Finished processing jellyseerr webhook for {subject}")
@@ -718,6 +732,7 @@ def gen_subtitles_queue_jellyseerr(media: MediaInfo,
         },
         on_start=jellyseer_write_comment,
         on_update=jellyseer_write_comment,
+        on_progress=jellyseer_overwrite_comment,
         on_error=jellyseer_write_comment,
         on_skip=jellyseer_write_comment,
         on_complete=[
@@ -729,6 +744,8 @@ def gen_subtitles_queue_jellyseerr(media: MediaInfo,
     
     gen_subtitles_queue(path_mapping(media.path), transcription_type, force_language, True, subtitle_event_handler)
     return
+
+
 
 def jellyseer_write_comment(jellyseerr_issue_id: int, message: str, jellyseerr_api_key: str, jellyseerr_base_url: str = "localhost:5055"):
     """
@@ -759,7 +776,10 @@ def jellyseer_write_comment(jellyseerr_issue_id: int, message: str, jellyseerr_a
         
         # Log the JSON response content
         response_json = response.json()
-        # logging.debug(f"Response JSON: {response_json}")
+        
+        
+        
+        logging.debug(f"Wrote comment with id: {response_json['id']}")
         
         logging.info(f"Comment successfully sent to issue {jellyseerr_issue_id}")
         return {"success": True, "message": "Comment sent successfully", "response": response_json}
@@ -767,6 +787,61 @@ def jellyseer_write_comment(jellyseerr_issue_id: int, message: str, jellyseerr_a
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending comment to issue {jellyseerr_issue_id}: {str(e)}")
         return {"success": False, "error": str(e)}
+
+
+def jellyseer_overwrite_comment(jellyseerr_issue_id: int, message: str, jellyseerr_api_key: str, jellyseerr_base_url: str = "localhost:5055", comment_id: int | None = None):
+    """
+    Sends a comment to a specific issue in Jellyseerr/Overseerr.
+
+    :param jellyseerr_issue_id: The ID of the issue to comment on.
+    :param message: The comment message.
+    :param jellyseerr_api_key: The API key for authentication.
+    :param jellyseerr_base_url: The base URL of the Jellyseerr/Overseerr server.
+    :return: A success message or error details.
+    """
+    if not (jellyseerr_api_key and jellyseerr_base_url):
+        logging.warning("No Jellyseerr/Overseerr API key or base URL provided.")
+        return
+    
+    logging.debug(f"Sending comment to Jellyseerr/Overseerr: {message}")
+    
+    
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Api-Key": jellyseerr_api_key
+    }
+    data = {"message": message}
+
+    try:
+
+        if not comment_id:
+            url = f"{jellyseerr_base_url}/api/v1/issue/{jellyseerr_issue_id}/comment"
+            response = requests.post(url, json=data, headers=headers)
+            response.raise_for_status()  # Raises an error for 4xx and 5xx status codes
+        
+            response_json = response.json()
+            # Iterate through the comments to find the matching message
+            for comment in response_json['comments']:
+                if comment['message'] == message:
+                    comment_id = comment['id']
+                    break
+            else:
+                logging.warning(f"No message found matching '{message}'")
+            logging.debug(f"Wrote new comment {message} with id: {comment_id}")
+        else:
+            url = f"{jellyseerr_base_url}/api/v1/issueComment/{comment_id}"
+            response = requests.put(url, json=data, headers=headers)
+            response.raise_for_status()
+            logging.debug(f"Overwrote comment {message} with id: {comment_id}")
+        
+        
+        return {"success": True, "comment_id": comment_id}
+    
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending comment to issue {jellyseerr_issue_id}: {str(e)}")
+        return {"success": False, "error": str(e)}
+
 
 def jellyseer_mark_resolved(jellyseerr_issue_id: int, jellyseerr_api_key: str, jellyseerr_base_url: str = "localhost:5055"):
     """
@@ -1375,7 +1450,9 @@ def detect_language_task(path, skip_skip_check = False, event_handler: Optional[
         if  detected_language:
             logging.info(f"[Detect language task] Detected language of file: {os.path.basename(path)} is: {detected_language.to_name()}. Will add it to the gen subtitles queue")
             if event_handler: 
-                event_handler.on_detected_language(message=f"Detected language: {detected_language.to_name()}")
+                event_handler.on_detect_language(message=f"Detected language: {detected_language.to_name()}")
+            else:
+                logging.warning("SubtitleEventHandler is None")
             gen_subtitles_queue(path, transcribe_or_translate, force_language=detected_language, skip_skip_check=skip_skip_check, event_handler=event_handler)
     
     except Exception as e:
@@ -1670,9 +1747,20 @@ def gen_subtitles(file_path: str,
         if word_level_highlight and word_highlight_color:
             srt_vtt_word_formatting = (f'<font color="#{word_highlight_color}">', '</font>')
          
+        subtitle_file_name = None
+         
         if should_stream_subtitle:
             logging.info(f"Transcribing in chunks (streaming subtitle): {file_path}")
-            stream_subtitle(file_path, current_subtitle_tags, write_intro=append, srt_vtt_word_formatting=srt_vtt_word_formatting, language=force_language, segment_duration=segment_duration, transcription_prompt=transcription_prompt, transcription_type=transcription_type, **args)
+            subtitle_file_name = stream_subtitle(file_path, 
+                                                 current_subtitle_tags, 
+                                                 write_intro=append, 
+                                                 srt_vtt_word_formatting=srt_vtt_word_formatting, 
+                                                 language=force_language, 
+                                                 segment_duration=segment_duration, 
+                                                 transcription_prompt=transcription_prompt, 
+                                                 transcription_type=transcription_type,
+                                                 event_handler=event_handler,
+                                                 **args)
         
         else:
             #Normal transcribe    
@@ -1705,14 +1793,23 @@ def gen_subtitles(file_path: str,
                 if subtitle_file_name:
                     result.to_srt_vtt(subtitle_file_name, word_level=word_level_highlight, tag=srt_vtt_word_formatting)
                     logging.info(f"Subtitle file written to: {subtitle_file_name}")
-                else:
-                    logging.warning(f"Subtitle file not written for {file_path}")
             #TODO maybe multiple output formats?
 
         elapsed_time = time.time() - start_time
         minutes, seconds = divmod(int(elapsed_time), 60)
-        logging.info(
-            f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+        
+        if subtitle_file_name:
+            message = f"Wrote {os.path.basename(subtitle_file_name)} to {subtitle_file_name}, it took {minutes} minutes and {seconds} seconds to complete."
+            logging.info(message)
+            # Execute the on_complete action if provided
+            if event_handler:
+                event_handler.on_complete(message=message) #
+        else:
+            message = f"Couldn't write subtitle file, it took {minutes} minutes and {seconds} seconds to complete."
+            logging.warning(message)
+            if event_handler:
+                event_handler.on_error(message=message)
+                
 
     except Exception as e:
         logging.warning(f"Error processing or transcribing {file_path} in {force_language}: {e}")
@@ -1727,12 +1824,6 @@ def gen_subtitles(file_path: str,
     finally:
         if skip_list_file_name:
             write_to_skip_list(skip_list_file_name, file_path)
-        
-        # Execute the on_complete action if provided
-        if event_handler:
-            event_handler.on_complete(message="Completed task!") #TODO change this to include the subtitle file name or just the tags
-        else:
-            logging.warning("SubtitleEventHandler is None")
             
         delete_model()
 
@@ -1923,12 +2014,21 @@ def split_audio_in_memory(input_file, chunk_duration_ms, audio_track_index):
     
     return chunks
 
-def stream_subtitle(input_file, subtitle_tags, srt_vtt_word_formatting = "", write_intro = True, language: LanguageCode = LanguageCode.NONE, segment_duration: int = 60, transcription_prompt: str = "", transcription_type: str = "transcribe", **args):
+def stream_subtitle(input_file, 
+                    subtitle_tags, 
+                    srt_vtt_word_formatting = "", 
+                    write_intro = True, 
+                    language: LanguageCode = LanguageCode.NONE, 
+                    segment_duration: int = 60, 
+                    transcription_prompt: str = "", 
+                    transcription_type: str = "transcribe",
+                    event_handler: Optional[SubtitleEventHandler] = None,
+                    **args):
     subtitle_file = name_subtitle(input_file, tags=subtitle_tags)
     
     if subtitle_file is None:
         logging.warning(f"Subtitle file could not be written for {input_file}")
-        return
+        return None
     
     index = 0
     
@@ -1977,16 +2077,21 @@ def stream_subtitle(input_file, subtitle_tags, srt_vtt_word_formatting = "", wri
             # Calculate processing speed (audio seconds per real-time second)
             total_audio_processed = segment_index * segment_duration
             processing_speed = total_audio_processed / elapsed_time  # seconds of audio per second of real time
+            transcribed_until = transcribe_offset_seconds + start_time + segment_duration 
 
-            logging.info(
-                f"Progress: {percentage:.2f}% ({segment_index}/{total_segments}) completed. "
-                f"Elapsed time: {sec2vtt(elapsed_time)}, Estimated remaining time: {sec2vtt(estimated_time_remaining)}, "
-                f"Total estimated time: {sec2vtt(estimated_total_time)}. Speed: {processing_speed:.2f}x (audio seconds/second)."
-            )
+            message = f"Progress: {percentage:.2f}% ({segment_index}/{total_segments}) completed.\n" \
+                    f"Elapsed time: {sec2vtt(elapsed_time)}, Estimated remaining time: {sec2vtt(estimated_time_remaining)},\n" \
+                    f"Total estimated time: {sec2vtt(estimated_total_time)}. Speed: {processing_speed:.2f}x (audio seconds/second).\n\n" \
+                    f"Subtitle written until {sec2vtt(transcribed_until)} of {sec2vtt(total_duration)}"
+            
+            logging.info(message)
+            if event_handler:
+                event_handler.on_progress(message=message)
         else:
             logging.warning(f"Audio segment from {start_time} to {start_time + segment_duration} not extracted.")
     logging.info(f"Transcription complete. Wrote everything to {subtitle_file}. It took {sec2vtt(elapsed_time)}")
     # delete_model()
+    return subtitle_file
             
             
 
@@ -2251,12 +2356,12 @@ def gen_subtitles_queue(file_path: str,
         # make a detect language task
         task_id = { 'path': file_path, 'type': "detect_language", 'skip_skip_check': skip_skip_check, 'event_handler': event_handler }
         task_queue.put(task_id)
-        logging.debug(f"task_queue.put(task_id)({file_path}, detect_language)")
+        logging.debug(f"task_queue.put(task_id)({file_path}, detect_language, skip_skip_check={skip_skip_check})")
         return
     
     
     if not skip_skip_check:
-        skip_reason =have_to_skip(file_path, force_language)
+        skip_reason = have_to_skip(file_path, force_language)
         if skip_reason:
             message = f"Skipping {os.path.basename(file_path)}. {skip_reason.value}."
             logging.debug(message)

@@ -1,5 +1,5 @@
 from typing import Optional, Callable, Dict, Any, List, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 
 @dataclass
@@ -9,6 +9,7 @@ class SubtitleEventConfig:
     """
     callback: Callable
     specific_args: Dict[str, Any] = None
+    state: Dict[str, Any] = field(default_factory=dict)  # Add a state dictionary
 
     def __post_init__(self):
         """Initialize specific_args to empty dict if None."""
@@ -18,9 +19,10 @@ class SubtitleEventConfig:
     def execute(self, shared_args: Dict[str, Any], **runtime_args) -> Any:
         """
         Execute the callback with all arguments combined.
-        Priority: runtime_args > specific_args > shared_args
+        Priority: runtime_args > state > specific_args > shared_args
         """
-        args = {**shared_args, **self.specific_args, **runtime_args}
+        # Merge the state into the arguments
+        args = {**shared_args, **self.specific_args, **self.state, **runtime_args}
         
         # Get the function signature
         signature = inspect.signature(self.callback)
@@ -32,7 +34,12 @@ class SubtitleEventConfig:
             if param in signature.parameters
         }
         
-        return self.callback(**valid_args)
+        # Execute the callback and store the result in the state
+        result = self.callback(**valid_args)
+        if result is not None:
+            self.state.update(result)  # Update the state with the result
+        
+        return result
 
 
 class SubtitleEventHandler:
@@ -44,9 +51,11 @@ class SubtitleEventHandler:
         shared_args: Dict[str, Any] = None,
         on_start: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None,
         on_update: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None,
+        on_detect_language: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None,
         on_complete: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None,
         on_error: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None,
-        on_skip: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None
+        on_skip: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None,
+        on_progress: Union[Callable, tuple[Callable, dict], List[Union[Callable, tuple[Callable, dict]]], None] = None  # Add on_progress
     ):
         """
         Initialize the handler with callbacks and arguments.
@@ -55,18 +64,22 @@ class SubtitleEventHandler:
             shared_args: Arguments shared between all callbacks (e.g., api_key, base_url)
             on_start: Single callback, tuple, or list of callbacks for start event
             on_update: Single callback, tuple, or list of callbacks for update event
-            on_finish: Single callback, tuple, or list of callbacks for finish event
+            on_detect_language: Single callback, tuple, or list of callbacks for language detection event
+            on_complete: Single callback, tuple, or list of callbacks for completion event
             on_error: Single callback, tuple, or list of callbacks for error event
+            on_skip: Single callback, tuple, or list of callbacks for skip event
+            on_progress: Single callback, tuple, or list of callbacks for progress event
         """
         self._shared_args = shared_args or {}
         
         # Convert all callbacks to SubtitleEventConfig objects
         self._on_start = self._create_configs(on_start)
         self._on_update = self._create_configs(on_update)
+        self._on_detect_language = self._create_configs(on_detect_language)
         self._on_complete = self._create_configs(on_complete)
         self._on_error = self._create_configs(on_error)
         self._on_skip = self._create_configs(on_skip)
-        #TODO maybe on_progress, on_detect_language
+        self._on_progress = self._create_configs(on_progress)  # Add on_progress
 
     def _create_config(self, item) -> Optional[SubtitleEventConfig]:
         """
@@ -124,6 +137,10 @@ class SubtitleEventHandler:
     def on_update(self, **kwargs) -> List[Any]:
         """Execute all update callbacks with runtime arguments."""
         return self._execute_event(self._on_update, **kwargs)
+
+    def on_detect_language(self, **kwargs) -> List[Any]:
+        """Execute all language detection callbacks with runtime arguments."""
+        return self._execute_event(self._on_detect_language, **kwargs)
     
     def on_complete(self, **kwargs) -> List[Any]:
         """Execute finish callback(s) with runtime arguments."""
@@ -136,3 +153,7 @@ class SubtitleEventHandler:
     def on_error(self, **kwargs) -> List[Any]:
         """Execute error callback(s) with runtime arguments."""
         return self._execute_event(self._on_error, **kwargs)
+    
+    def on_progress(self, **kwargs) -> List[Any]:
+        """Execute progress callback(s) with runtime arguments."""
+        return self._execute_event(self._on_progress, **kwargs)

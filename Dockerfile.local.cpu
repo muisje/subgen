@@ -18,4 +18,4 @@ ENV PYTHONUNBUFFERED=1
 
 COPY *.py /subgen/
 
-CMD [ "bash", "-c", "python3 -u launcher.py" ]
+CMD [ "bash", "-c", "python3 -u subgen.py" ]

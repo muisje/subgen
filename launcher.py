@@ -77,29 +77,6 @@ def prompt_and_save_bazarr_env_variables():
 
     print("Environment variables have been saved to subgen.env")
 
-def load_env_variables(env_filename='subgen.env'):
-    """
-    Loads environment variables from a specified .env file and sets them.
-    """
-    try:
-        with open(env_filename, 'r') as file:
-            for line in file:
-                line = line.strip()
-                # Skip empty lines or lines starting with a comment
-                if not line or line.startswith('#'):
-                    continue
-                
-                # Split line into variable and value, allow comments after the value
-                if '#' in line:
-                    line = line.split('#', 1)[0].strip()  # Ignore anything after the # symbol
-                    
-                var, value = line.strip().split('=', 1)
-                os.environ[var] = value
-
-        print(f"Environment variables have been loaded from {env_filename}")
-
-    except FileNotFoundError:
-        print(f"{env_filename} file not found. Please run prompt_and_save_env_variables() first.")
 
 def main():
     global child_process  # We'll need to refer to the child process later
@@ -159,7 +136,6 @@ def main():
 
     if args.setup_bazarr: 
         prompt_and_save_bazarr_env_variables()
-    load_env_variables()
 
     # URL to the requirements.txt file on GitHub
     requirements_url = "https://raw.githubusercontent.com/McCloudS/subgen/main/requirements.txt"
@@ -206,41 +182,50 @@ def main():
         signal.signal(signal.SIGTERM, forward_signal)
         
         try:
-            # Get file descriptors for stdout and stderr
             stdout_fd = child_process.stdout.fileno()
             stderr_fd = child_process.stderr.fileno()
-            
-            # Create sets for select
             read_fds = [stdout_fd, stderr_fd]
             
-            while child_process.poll() is None:
-                # Wait for output on either stream
+            # Track EOF status for stdout and stderr
+            stdout_eof = False
+            stderr_eof = False
+            
+            while True:
+                # Wait for output or process exit
                 readable, _, _ = select.select(read_fds, [], [], 0.1)
                 
+                # Read available data
                 for fd in readable:
                     if fd == stdout_fd:
                         output = child_process.stdout.readline()
                         if output:
                             print(output.rstrip(), flush=True)
+                        else:
+                            # EOF reached for stdout
+                            stdout_eof = True
+                            read_fds.remove(stdout_fd)
                     elif fd == stderr_fd:
                         error = child_process.stderr.readline()
                         if error:
                             print(error.rstrip(), file=sys.stderr, flush=True)
+                        else:
+                            # EOF reached for stderr
+                            stderr_eof = True
+                            read_fds.remove(stderr_fd)
+                
+                # Check if process has exited and all pipes are closed
+                if child_process.poll() is not None:
+                    if stdout_eof and stderr_eof:
+                        break  # All data read, exit loop
             
-            # Get final output
-            stdout, stderr = child_process.communicate()
-            if stdout:
-                print(stdout.rstrip(), flush=True)
-            if stderr:
-                print(stderr.rstrip(), file=sys.stderr, flush=True)
-            
+            # Process has exited and all output is read
             return_code = child_process.wait()
             sys.exit(return_code)
             
         finally:
             signal.signal(signal.SIGINT, signal.default_int_handler)
             signal.signal(signal.SIGTERM, signal.default_int_handler)
-        
+            
 if __name__ == "__main__":
     exit_code = main()
     sys.exit(exit_code)
