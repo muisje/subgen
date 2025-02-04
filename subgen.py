@@ -156,6 +156,9 @@ if not subtitle_tag_delimiter or subtitle_tag_delimiter == "":
 shutdown_event = threading.Event()
 
 
+model_lock = threading.Lock() #To prevent loading the multiple times at the same time which causes an error
+
+
 
 def force_exit():
     logging.info("Shutdown timeout reached. Forcing exit.")
@@ -1747,19 +1750,20 @@ def extract_audio_segment_to_memory(input_file, start_time, duration):
         return None
 
 def start_model():
-    global model
-    #TODO add lock
-    if model is None:
-        logging.debug("Model was purged, need to re-create")
-        model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
+    with model_lock:
+        global model
+        if model is None:
+            logging.debug("Model was purged, need to re-create")
+            model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
 
 
 def delete_model():
     gc.collect()
-    if clear_vram_on_complete and task_queue.qsize() == 0:
-        global model
-        logging.debug("Queue is empty, clearing/releasing VRAM")
-        model = None
+    with model_lock:
+        if clear_vram_on_complete and task_queue.qsize() == 0 and model is not None:
+            global model
+            logging.debug("Queue is empty, clearing/releasing VRAM")
+            model = None
 
 def isAudioFileExtension(file_extension):
     return file_extension.casefold() in \
