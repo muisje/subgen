@@ -12,6 +12,15 @@ class UniqueLifoQueue(queue.LifoQueue):
         if hashable_item not in self._set:
             self._set.add(hashable_item)
             super().put(item, block, timeout)  # Call the parent put method
+            return True
+        return False
+
+    def put_force(self, item, block=True, timeout=None):
+        # Always add the item, even if it has been added before
+        # Convert item to hashable type
+        hashable_item = self._make_hashable(item)
+        self._set.add(hashable_item)
+        super().put(item, block, timeout)  # Call the parent put method
 
     def get(self, block=True, timeout=None):
         item = super().get(block, timeout)  # Call the parent get method
