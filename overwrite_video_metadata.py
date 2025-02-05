@@ -3,6 +3,7 @@ import logging
 import os
 from typing import Dict, Any, List
 from language_code import LanguageCode
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -137,20 +138,15 @@ def over_write_audio_language_metadata(input_file: str, languages: Dict[int, Lan
                       Example: {0: LanguageCode.PORTUGUESE, 1: LanguageCode.DUTCH}
     :return: True if the metadata was successfully updated and verified; False otherwise.
     """
-    # Prepare temporary file for output
-    base, ext = os.path.splitext(input_file)
-    output_file = f"{base}.tmp{ext}"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, os.path.basename(input_file))
+        
+        set_audio_languages_mapped(input_file, output_file, languages)
+        
+        success = verify_audio_languages_mapped(output_file, languages)
+        
+        if success:
+            os.replace(output_file, input_file)
     
-    set_audio_languages_mapped(input_file, output_file, languages)
+    return success 
     
-    succes = verify_audio_languages_mapped(output_file, languages)
-    
-    if succes:
-        # Replace the original file with the modified file
-        os.replace(output_file, input_file)
-
-    #Wheter it's a succes or not we need to clean up the temp file
-    if os.path.exists(output_file):
-        os.remove(output_file)
-    
-    return succes
